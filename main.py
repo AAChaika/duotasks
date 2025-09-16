@@ -1,26 +1,35 @@
 """
-GamifiedTaskBot — Step 3c: Completions + XP + Streaks + Badges
+GamifiedTaskBot — Step 3c (clean): Users + Tasks + Completions + XP + Streaks + Badges
 
-What’s new in 3c
-- `completions` table
-- Inline ✅ DONE now records a completion
-- XP formula: 10 × difficulty + 2 × streak (streak bonus capped at +20)
-- Streak rule: first completion of a day sets/keeps the streak; missing a day resets
-- Level: 1 + xp // 100
-- Badge unlocks by streak thresholds (Jerboa→Elephant)
-- Double-tap guard: ignore duplicate DONE for the same task within 2 seconds
+This is a **complete working file** for the current MVP state, including:
+- /start, /help, /profile
+- /addtask wizard (title → difficulty; default difficulty=1)
+- /list (each task as a separate message with short buttons: ✅ Done / 🗑 Remove)
+- /remove (delete-only view)
+- ✅ completion inserts into `completions`, awards XP, updates streak/level/badges, and archives the task
+- Double-tap guard (2s)
 
-Next steps (3d/3e): reminders and ready-list bonus
+Persistence:
+- Set env `DB_PATH` to your mounted volume path.
+  *Railway default:* `/mnt/data/gamify.db`
+  *Render example:* `/var/data/gamify.db`
+- Optional one-time migration copies a stray old DB into the mounted path if present.
 
-Deploy
-- Env: TELEGRAM_TOKEN=<token>
-- Optional: DB_PATH=/data/gamify.db (default)
-- Start command: python main.py
+Run locally:
+  export TELEGRAM_TOKEN=123456:ABC...
+  export DB_PATH=./gamify.db
+  pip install "python-telegram-bot>=20" tzdata
+  python main.py
+
+Deploy:
+  Start command: `python main.py`
+
 """
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
@@ -41,7 +50,7 @@ from telegram.ext import (
 # --- Config ---
 TZ = ZoneInfo("Europe/Belgrade")
 BOT_NAME = "GamifiedTaskBot"
-DB_PATH = os.getenv("DB_PATH", "/data/gamify.db")
+DB_PATH = os.getenv("DB_PATH", "/mnt/data/gamify.db")  # Railway-friendly default
 
 # --- Logging ---
 logging.basicConfig(
@@ -49,9 +58,28 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(BOT_NAME)
+logger.info("DB_PATH=%s", DB_PATH)
 
 
 # ========================= DB LAYER =========================
+
+def _maybe_migrate_old_db():
+    """Copy an old DB into the mounted path once, if destination missing."""
+    dest = DB_PATH
+    dest_dir = os.path.dirname(dest) or "."
+    os.makedirs(dest_dir, exist_ok=True)
+    if os.path.exists(dest):
+        return
+    candidates = ["/app/gamify.db", "/data/gamify.db", "/var/data/gamify.db", "./gamify.db"]
+    for src in candidates:
+        try:
+            if os.path.exists(src):
+                shutil.copy2(src, dest)
+                logger.info("Migrated DB from %s -> %s", src, dest)
+                return
+        except Exception as e:
+            logger.warning("DB migration from %s failed: %s", src, e)
+
 
 def get_conn() -> sqlite3.Connection:
     db_dir = os.path.dirname(DB_PATH) or "."
@@ -62,6 +90,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db():
+    _maybe_migrate_old_db()
     with get_conn() as conn:
         conn.executescript(
             """
@@ -183,7 +212,7 @@ def badge_tier_for_streak(streak: int) -> int:
     return 0
 
 
-# ========================= BOT HANDLERS =========================
+# ========================= COMMAND HANDLERS =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_db()
     user = update.effective_user
@@ -208,26 +237,89 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/profile — XP, Level, Streak, Badges\n"
         "/reminder — Daily reminders toggle (next steps)\n"
     )
-    await update.message.reply_text("No active tasks. Use /addtask to create one.\n\nIdeas: quick chores, 10-min study, a movie to start, 3 pages to read.")
+    await update.message.reply_text(text)
+
+
+# ---- /profile ----
+async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    init_db()
+    user = update.effective_user
+    up = get_or_create_user(user)
+
+    current_badge = badge_name_for_streak(up.streak_current) or "—"
+    best_badge = badge_name_for_streak(up.streak_best) or "—"
+
+    with get_conn() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND active=1", (user.id,))
+        (active_count,) = cur.fetchone()
+
+    text = (
+        "👤 <b>Profile</b>\n"
+        f"XP: <b>{up.xp}</b>\n"
+        f"Level: <b>{up.level}</b>\n"
+        f"Streak: <b>{up.streak_current}</b> (best {up.streak_best})\n"
+        f"Current badge: <b>{current_badge}</b> · Best badge: <b>{best_badge}</b>\n"
+        f"Active tasks: <b>{active_count}</b>\n"
+    )
+    await update.message.reply_html(text)
+
+
+# ---- /addtask (wizard) ----
+TITLE, DIFF = range(2)
+
+async def addtask_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    get_or_create_user(update.effective_user)
+    await update.message.reply_text("What’s the task title?")
+    return TITLE
+
+
+async def addtask_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_title"] = (update.message.text or "").strip()[:120]
+    await update.message.reply_text("Difficulty? Send 1 (easy), 2 (medium), or 3 (hard). Default is 1.")
+    return DIFF
+
+
+async def addtask_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text not in {"1", "2", "3"}:
+        difficulty = 1
+    else:
+        difficulty = int(text)
+
+    title = context.user_data.get("new_title", "Untitled")
+    user_id = update.effective_user.id
+
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO tasks (user_id, title, difficulty, active, created_at) VALUES (?, ?, ?, 1, ?)",
+            (user_id, title, difficulty, datetime.now(TZ).isoformat()),
         )
-        return
 
-    # Header once
-    await update.message.reply_text("Your tasks:")
+    await update.message.reply_html(f"Added: <b>{title}</b> (difficulty {difficulty}).")
+    context.user_data.pop("new_title", None)
+    return ConversationHandler.END
 
-    # Send each task as its own message so the full title is visible in the message body
-    for tid, title in rows:
-        try:
-            await update.message.reply_text(
-                f"• {title}",
-                reply_markup=build_task_kb(tid),
-            )
-        except Exception:
-            # Fallback: still show a tappable row even if message fails
-            await update.message.reply_text(
-                "• (couldn't render title)",
-                reply_markup=build_task_kb(tid),
-            ):
+
+async def addtask_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("new_title", None)
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+# ---- /list & /remove ----
+
+def build_task_kb(task_id: int):
+    # Short labels to avoid Telegram's 64-char button text limit
+    buttons = [
+        [
+            InlineKeyboardButton("✅ Done", callback_data=f"DONE_{task_id}"),
+            InlineKeyboardButton("🗑 Remove", callback_data=f"DEL_{task_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     with get_conn() as conn:
         cur = conn.execute(
@@ -237,10 +329,21 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = cur.fetchall()
 
     if not rows:
-        await update.message.reply_text("No active tasks. Use /addtask to create one.\n\nIdeas: quick chores, 10-min study, a movie to start, 3 pages to read.")
+        await update.message.reply_text(
+            "No active tasks. Use /addtask to create one.\n\n"
+            "Ideas: quick chores, 10-min study, a movie to start, 3 pages to read."
+        )
         return
 
-    await update.message.reply_text("Your tasks:", reply_markup=build_task_kb(rows))
+    # Header once
+    await update.message.reply_text("Your tasks:")
+
+    # One message per task: full title in body, short buttons
+    for tid, title in rows:
+        await update.message.reply_text(
+            f"• {title}",
+            reply_markup=build_task_kb(tid),
+        )
 
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -260,22 +363,10 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tid, title in rows:
         await update.message.reply_text(
             f"• {title}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Remove", callback_data=f"DEL_{tid}")]]),
-        ):
-    user_id = update.effective_user.id
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT id, title FROM tasks WHERE user_id=? AND active=1 ORDER BY id DESC LIMIT 25",
-            (user_id,),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🗑 Remove", callback_data=f"DEL_{tid}")]]
+            ),
         )
-        rows = cur.fetchall()
-
-    if not rows:
-        await update.message.reply_text("Nothing to remove. Use /addtask to create one.")
-        return
-
-    buttons = [[InlineKeyboardButton(f"🗑️ {title}", callback_data=f"DEL_{tid}")] for tid, title in rows]
-    await update.message.reply_text("Choose a task to delete:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 # ========================= COMPLETION LOGIC =========================
@@ -338,7 +429,7 @@ def _award_xp_and_streak(user_id: int, base_points: int) -> tuple[int, int, int,
 async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str]:
     """
     Inserts completion if not a double-tap (2s). Returns (gained_xp, badge_unlocked, badge_name_if_any)
-    Also archives the task (sets active=0) after a valid completion so it disappears from /list.
+    Archives the task in the same action so it disappears from /list.
     """
     now_iso = datetime.now(TZ).isoformat()
     with get_conn() as conn:
@@ -372,21 +463,20 @@ async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str
             (task_id, user_id, now_iso),
         )
 
-    base_points = 10 * max(1, min(difficulty, 3))
-    gained, lvl, new_streak, unlocked = _award_xp_and_streak(user_id, base_points)
-
-    # Archive task after a valid completion so it disappears from /list
-    with get_conn() as conn:
+        # Archive the task right away (same transaction scope)
         conn.execute(
             "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
             (task_id, user_id),
         )
 
+    base_points = 10 * max(1, min(difficulty, 3))
+    gained, lvl, new_streak, unlocked = _award_xp_and_streak(user_id, base_points)
+
     badge_name = badge_name_for_streak(new_streak) if unlocked else ""
     return gained, unlocked, badge_name or ""
 
 
-# ---- Callbacks for inline buttons ----
+# ---- Inline button callbacks ----
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -421,6 +511,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ========================= MAIN =========================
+
 def main():
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
