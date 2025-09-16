@@ -208,13 +208,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/profile — XP, Level, Streak, Badges\n"
         "/reminder — Daily reminders toggle (next steps)\n"
     )
-    await update.message.reply_text(
-            (
-                "No active tasks. Use /addtask to create one.
-
-"
-                "Ideas: quick chores, 10-min study, a movie to start, 3 pages to read."
-            )
+    await update.message.reply_text("No active tasks. Use /addtask to create one.\n\nIdeas: quick chores, 10-min study, a movie to start, 3 pages to read.")
         )
         return
 
@@ -243,10 +237,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = cur.fetchall()
 
     if not rows:
-        await update.message.reply_text(
-            "No active tasks. Use /addtask to create one.\n\n"
-            "Ideas: quick chores, 10‑min study, a movie to start, 3 pages to read."
-        )
+        await update.message.reply_text("No active tasks. Use /addtask to create one.\n\nIdeas: quick chores, 10-min study, a movie to start, 3 pages to read.")
         return
 
     await update.message.reply_text("Your tasks:", reply_markup=build_task_kb(rows))
