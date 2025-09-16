@@ -1,63 +1,67 @@
 """
-GamifiedTaskBot — Step 3d: Reminders
+GamifiedTaskBot — Step 3c: Completions + XP + Streaks + Badges
 
-Adds:
-- Daily streak reminder at 20:00 Europe/Belgrade if no completion today (toggle: /reminder on|off)
-- Daily empty-list reminder at 10:00 Europe/Belgrade if active tasks = 0 (one ping/day)
-- Instant gentle nudge when the list becomes empty (debounced via per-day flag)
+What’s new in 3c
+- `completions` table
+- Inline ✅ DONE now records a completion
+- XP formula: 10 × difficulty + 2 × streak (streak bonus capped at +20)
+- Streak rule: first completion of a day sets/keeps the streak; missing a day resets
+- Level: 1 + xp // 100
+- Badge unlocks by streak thresholds (Jerboa→Elephant)
+- Double-tap guard: ignore duplicate DONE for the same task within 2 seconds
 
-Build on top of Step 3c (Cleaned): same DB + WAL + serialized writes via asyncio.Lock
+Next steps (3d/3e): reminders and ready-list bonus
+
+Deploy
+- Env: TELEGRAM_TOKEN=<token>
+- Optional: DB_PATH=/data/gamify.db (default)
+- Start command: python main.py
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
-# ---------------- Config ----------------
+# --- Config ---
 TZ = ZoneInfo("Europe/Belgrade")
 BOT_NAME = "GamifiedTaskBot"
 DB_PATH = os.getenv("DB_PATH", "/data/gamify.db")
 
+# --- Logging ---
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(BOT_NAME)
 
-logger.info("DB_PATH=%s", DB_PATH)
 
-# Serialize ALL writes to SQLite to avoid "database is locked"
-DB_LOCK = asyncio.Lock()
-
-# -------------- DB Layer --------------
+# ========================= DB LAYER =========================
 
 def get_conn() -> sqlite3.Connection:
     db_dir = os.path.dirname(DB_PATH) or "."
     os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
     return conn
 
 
-def init_db() -> None:
+def init_db():
     with get_conn() as conn:
         conn.executescript(
             """
@@ -96,14 +100,6 @@ def init_db() -> None:
             """
         )
 
-    # Simple migration: add empty_list_notified_date column if missing
-    try:
-        with get_conn() as conn:
-            conn.execute("ALTER TABLE users ADD COLUMN empty_list_notified_date TEXT")
-    except sqlite3.OperationalError:
-        # Column already exists
-        pass
-
 
 @dataclass
 class UserProfile:
@@ -123,8 +119,7 @@ class UserProfile:
 def get_or_create_user(teleg_user) -> UserProfile:
     with get_conn() as conn:
         cur = conn.execute(
-            "SELECT user_id, chat_id, username, xp, level, streak_current, streak_best, "
-            "best_badge_tier, last_activity_date, reminder_enabled, ready_list_bonus_date "
+            "SELECT user_id, chat_id, username, xp, level, streak_current, streak_best, best_badge_tier, last_activity_date, reminder_enabled, ready_list_bonus_date "
             "FROM users WHERE user_id=?",
             (teleg_user.id,),
         )
@@ -156,7 +151,8 @@ def get_or_create_user(teleg_user) -> UserProfile:
         )
 
 
-# -------------- Badges --------------
+# ========================= BADGE UTILS =========================
+
 BADGE_TIERS = [
     (300, "Elephant 🐘"),
     (200, "Tiger 🐯"),
@@ -187,36 +183,9 @@ def badge_tier_for_streak(streak: int) -> int:
     return 0
 
 
-# -------------- Helpers --------------
-
-def today_local() -> date:
-    return datetime.now(TZ).date()
-
-
-def active_task_count(user_id: int) -> int:
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE user_id=? AND active=1",
-            (user_id,),
-        )
-        (cnt,) = cur.fetchone()
-        return int(cnt)
-
-
-def had_completion_today(user_id: int) -> bool:
-    # Compare ISO timestamps within local day window
-    start = datetime.combine(today_local(), time(0, 0, tzinfo=TZ)).isoformat()
-    end = datetime.combine(today_local() + timedelta(days=1), time(0, 0, tzinfo=TZ)).isoformat()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT 1 FROM completions WHERE user_id=? AND completed_at>=? AND completed_at<? LIMIT 1",
-            (user_id, start, end),
-        )
-        return cur.fetchone() is not None
-
-
-# -------------- Handlers --------------
+# ========================= BOT HANDLERS =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    init_db()
     user = update.effective_user
     get_or_create_user(user)
     now_local = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
@@ -237,20 +206,23 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list — View active tasks\n"
         "/remove — Delete a task\n"
         "/profile — XP, Level, Streak, Badges\n"
-        "/reminder — Daily reminders on/off\n"
+        "/reminder — Daily reminders toggle (next steps)\n"
     )
     await update.message.reply_text(text)
 
 
 # ---- /profile ----
 async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    init_db()
     user = update.effective_user
     up = get_or_create_user(user)
 
     current_badge = badge_name_for_streak(up.streak_current) or "—"
     best_badge = badge_name_for_streak(up.streak_best) or "—"
 
-    cnt = active_task_count(user.id)
+    with get_conn() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND active=1", (user.id,))
+        (active_count,) = cur.fetchone()
 
     text = (
         "👤 <b>Profile</b>\n"
@@ -258,7 +230,7 @@ async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Level: <b>{up.level}</b>\n"
         f"Streak: <b>{up.streak_current}</b> (best {up.streak_best})\n"
         f"Current badge: <b>{current_badge}</b> · Best badge: <b>{best_badge}</b>\n"
-        f"Active tasks: <b>{cnt}</b>\n"
+        f"Active tasks: <b>{active_count}</b>\n"
     )
     await update.message.reply_html(text)
 
@@ -274,32 +246,27 @@ async def addtask_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addtask_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_title"] = (update.message.text or "").strip()[:120]
-    await update.message.reply_text(
-        "Difficulty? Send 1 (easy), 2 (medium), or 3 (hard). Default is 1."
-    )
+    await update.message.reply_text("Difficulty? Send 1 (easy), 2 (medium), or 3 (hard). Default is 1.")
     return DIFF
 
 
 async def addtask_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    difficulty = int(text) if text in {"1", "2", "3"} else 1
+    if text not in {"1", "2", "3"}:
+        difficulty = 1
+    else:
+        difficulty = int(text)
 
     title = context.user_data.get("new_title", "Untitled")
     user_id = update.effective_user.id
 
-    async with DB_LOCK:
-        with get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE;")
-            conn.execute(
-                "INSERT INTO tasks (user_id, title, difficulty, active, created_at) "
-                "VALUES (?, ?, ?, 1, ?)",
-                (user_id, title, difficulty, datetime.now(TZ).isoformat()),
-            )
-            conn.commit()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO tasks (user_id, title, difficulty, active, created_at) VALUES (?, ?, ?, 1, ?)",
+            (user_id, title, difficulty, datetime.now(TZ).isoformat()),
+        )
 
-    await update.message.reply_html(
-        f"Added: <b>{title}</b> (difficulty {difficulty})."
-    )
+    await update.message.reply_html(f"Added: <b>{title}</b> (difficulty {difficulty}).")
     context.user_data.pop("new_title", None)
     return ConversationHandler.END
 
@@ -312,21 +279,52 @@ async def addtask_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- /list & /remove ----
 
-def build_task_kb(rows: list[tuple[int, str]]):
-    buttons = []
-    for tid, title in rows:
-        buttons.append(
-            [
-                InlineKeyboardButton(f"✅ Done: {title}", callback_data=f"DONE_{tid}"),
-                InlineKeyboardButton("🗑️", callback_data=f"DEL_{tid}"),
-            ]
-        )
-    return InlineKeyboardMarkup(buttons) if buttons else None
+def build_task_kb(task_id: int):
+    # Short labels to avoid Telegram's 64-char button text limit
+    buttons = [
+        [
+            InlineKeyboardButton("✅ Done", callback_data=f"DONE_{task_id}"),
+            InlineKeyboardButton("🗑 Remove", callback_data=f"DEL_{task_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT id, title FROM tasks WHERE user_id=? AND active=1 ORDER BY id DESC LIMIT 25",
+            (user_id,),
+        )
+        rows = cur.fetchall()
 
+    if not rows:
+        await update.message.reply_text(
+            "No active tasks. Use /addtask to create one.
+
+"
+            "Ideas: quick chores, 10‑min study, a movie to start, 3 pages to read."
+        )
+        return
+
+    # Header once
+    await update.message.reply_text("Your tasks:")
+
+    # Send each task as its own message so the full title is visible in the message body
+    for tid, title in rows:
+        try:
+            await update.message.reply_text(
+                f"• {title}",
+                reply_markup=build_task_kb(tid),
+            )
+        except Exception:
+            # Fallback: still show a tappable row even if message fails
+            await update.message.reply_text(
+                "• (couldn't render title)",
+                reply_markup=build_task_kb(tid),
+            ):
+    user_id = update.effective_user.id
     with get_conn() as conn:
         cur = conn.execute(
             "SELECT id, title FROM tasks WHERE user_id=? AND active=1 ORDER BY id DESC LIMIT 25",
@@ -341,9 +339,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(
-        "Your tasks:", reply_markup=build_task_kb(rows)
-    )
+    await update.message.reply_text("Your tasks:", reply_markup=build_task_kb(rows))
 
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,180 +355,153 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nothing to remove. Use /addtask to create one.")
         return
 
-    buttons = [
-        [InlineKeyboardButton(f"🗑️ {title}", callback_data=f"DEL_{tid}")]
-        for tid, title in rows
-    ]
-    await update.message.reply_text(
-        "Choose a task to delete:", reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    await update.message.reply_text("Tap to remove:")
+    for tid, title in rows:
+        await update.message.reply_text(
+            f"• {title}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Remove", callback_data=f"DEL_{tid}")]]),
+        ):
+    user_id = update.effective_user.id
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT id, title FROM tasks WHERE user_id=? AND active=1 ORDER BY id DESC LIMIT 25",
+            (user_id,),
+        )
+        rows = cur.fetchall()
 
-
-# ---- Completion logic ----
-BADGE_NAME_CACHE: dict[int, str] = {}
-
-def _compute_streak_update(last_activity_date: str | None, today: date) -> int:
-    if not last_activity_date:
-        return 1
-    last_date = date.fromisoformat(last_activity_date)
-    if last_date == today:
-        return 0  # unchanged
-    if last_date == today - timedelta(days=1):
-        return +1
-    return -(10**6)  # reset signal
-
-
-async def _maybe_send_empty_list_nudge(application: Application, user_id: int, chat_id: int) -> None:
-    # Send immediate nudge if list is empty and we haven't notified today
-    if active_task_count(user_id) != 0:
+    if not rows:
+        await update.message.reply_text("Nothing to remove. Use /addtask to create one.")
         return
-    today = today_local().isoformat()
-    async with DB_LOCK:
-        with get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE;")
-            cur = conn.execute(
-                "SELECT empty_list_notified_date FROM users WHERE user_id=?",
-                (user_id,),
-            )
-            (last_notified,) = cur.fetchone()
-            if last_notified == today:
-                conn.rollback()
-                return
-            conn.execute(
-                "UPDATE users SET empty_list_notified_date=? WHERE user_id=?",
-                (today, user_id),
-            )
-            conn.commit()
-    await application.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "✨ Tip: keep a few small tasks ready so streaks stay easy.\n"
-            "Add ideas like quick chores, 10‑min study, or a movie to start. Try /addtask."
-        ),
-    )
+
+    buttons = [[InlineKeyboardButton(f"🗑️ {title}", callback_data=f"DEL_{tid}")] for tid, title in rows]
+    await update.message.reply_text("Choose a task to delete:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def _handle_completion(task_id: int, user_id: int, chat_id: int, application: Application) -> tuple[int, bool, str]:
-    now = datetime.now(TZ)
-    now_iso = now.isoformat()
+# ========================= COMPLETION LOGIC =========================
 
-    async with DB_LOCK:
-        with get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE;")
+def _today() -> date:
+    return datetime.now(TZ).date()
 
-            # 1) Validate task
-            cur = conn.execute(
-                "SELECT difficulty FROM tasks WHERE id=? AND user_id=? AND active=1",
-                (task_id, user_id),
-            )
-            row = cur.fetchone()
-            if not row:
-                conn.rollback()
-                raise ValueError("Task not found or inactive")
-            difficulty = int(row[0])
 
-            # 2) Double-tap guard (2s)
-            cur = conn.execute(
-                "SELECT completed_at FROM completions WHERE task_id=? AND user_id=? "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id, user_id),
-            )
-            last = cur.fetchone()
-            if last:
-                try:
-                    last_dt = datetime.fromisoformat(last[0])
-                    if (now - last_dt).total_seconds() <= 2:
-                        conn.rollback()
-                        return 0, False, ""
-                except Exception:
-                    pass
+def _award_xp_and_streak(user_id: int, base_points: int) -> tuple[int, int, int, bool]:
+    """
+    Returns (gained_xp, new_level, new_streak, badge_unlocked_bool)
+    """
+    today = _today()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT xp, level, streak_current, streak_best, last_activity_date, best_badge_tier FROM users WHERE user_id=?",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("User not found")
+        xp, level, streak_current, streak_best, last_date_str, best_badge_tier = row
 
-            # 3) Insert completion + archive task
-            conn.execute(
-                "INSERT INTO completions (task_id, user_id, completed_at) VALUES (?, ?, ?)",
-                (task_id, user_id, now_iso),
-            )
-            conn.execute(
-                "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
-                (task_id, user_id),
-            )
-
-            # 4) Fetch user & compute XP/Streak
-            cur = conn.execute(
-                "SELECT xp, level, streak_current, streak_best, last_activity_date, best_badge_tier "
-                "FROM users WHERE user_id=?",
-                (user_id,),
-            )
-            xp, level, streak_current, streak_best, last_date_str, best_badge_tier = cur.fetchone()
-
-            today = now.date()
-            delta = _compute_streak_update(last_date_str, today)
-            if delta == 0:
+        # Streak
+        if last_date_str:
+            last_date = date.fromisoformat(last_date_str)
+            if last_date == today:
+                # already counted today; streak unchanged
                 pass
-            elif delta > 0:
+            elif last_date == today - timedelta(days=1):
                 streak_current += 1
             else:
                 streak_current = 1
+        else:
+            streak_current = 1
 
-            if streak_current > streak_best:
-                streak_best = streak_current
+        if streak_current > streak_best:
+            streak_best = streak_current
 
-            base_points = 10 * max(1, min(difficulty, 3))
-            streak_bonus = min(streak_current, 10) * 2
-            gained = base_points + streak_bonus
-            xp += gained
-            level = 1 + xp // 100
+        # XP
+        streak_bonus = min(streak_current, 10) * 2
+        gained = base_points + streak_bonus
+        xp += gained
+        new_level = 1 + xp // 100
 
-            # Badge unlock
-            new_tier = badge_tier_for_streak(streak_current)
-            unlocked = new_tier > best_badge_tier
-            if unlocked:
-                best_badge_tier = new_tier
+        # Badge unlock check
+        new_tier = badge_tier_for_streak(streak_current)
+        unlocked = new_tier > best_badge_tier
+        if unlocked:
+            best_badge_tier = new_tier
 
-            conn.execute(
-                "UPDATE users SET xp=?, level=?, streak_current=?, streak_best=?, "
-                "last_activity_date=?, best_badge_tier=? WHERE user_id=?",
-                (xp, level, streak_current, streak_best, today.isoformat(), best_badge_tier, user_id),
-            )
+        conn.execute(
+            "UPDATE users SET xp=?, level=?, streak_current=?, streak_best=?, last_activity_date=?, best_badge_tier=? WHERE user_id=?",
+            (xp, new_level, streak_current, streak_best, today.isoformat(), best_badge_tier, user_id),
+        )
 
-            conn.commit()
+    return gained, new_level, streak_current, unlocked
 
-    badge_name = badge_name_for_streak(streak_current) if unlocked else ""
 
-    # After completion, if list is empty, send a gentle nudge to add tasks
-    await _maybe_send_empty_list_nudge(application, user_id, chat_id)
+async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str]:
+    """
+    Inserts completion if not a double-tap (2s). Returns (gained_xp, badge_unlocked, badge_name_if_any)
+    Also archives the task (sets active=0) after a valid completion so it disappears from /list.
+    """
+    now_iso = datetime.now(TZ).isoformat()
+    with get_conn() as conn:
+        # Validate task and get difficulty
+        cur = conn.execute(
+            "SELECT difficulty FROM tasks WHERE id=? AND user_id=? AND active=1",
+            (task_id, user_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("Task not found or inactive")
+        difficulty = int(row[0])
 
+        # Double-tap guard: last completion for this task within 2 seconds
+        cur = conn.execute(
+            "SELECT completed_at FROM completions WHERE task_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
+            (task_id, user_id),
+        )
+        last = cur.fetchone()
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(last[0])
+                if (datetime.now(TZ) - last_dt).total_seconds() <= 2:
+                    return 0, False, ""  # ignore
+            except Exception:
+                pass
+
+        # Record completion
+        conn.execute(
+            "INSERT INTO completions (task_id, user_id, completed_at) VALUES (?, ?, ?)",
+            (task_id, user_id, now_iso),
+        )
+
+    base_points = 10 * max(1, min(difficulty, 3))
+    gained, lvl, new_streak, unlocked = _award_xp_and_streak(user_id, base_points)
+
+    # Archive task after a valid completion so it disappears from /list
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
+            (task_id, user_id),
+        )
+
+    badge_name = badge_name_for_streak(new_streak) if unlocked else ""
     return gained, unlocked, badge_name or ""
 
 
-# ---- Callbacks ----
+# ---- Callbacks for inline buttons ----
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = (query.data or "").strip()
+    data = query.data or ""
     user_id = query.from_user.id
-    chat_id = query.message.chat_id
 
     try:
         if data.startswith("DEL_"):
             tid = int(data.split("_", 1)[1])
-            async with DB_LOCK:
-                with get_conn() as conn:
-                    conn.execute("BEGIN IMMEDIATE;")
-                    conn.execute(
-                        "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
-                        (tid, user_id),
-                    )
-                    conn.commit()
+            with get_conn() as conn:
+                conn.execute("UPDATE tasks SET active=0 WHERE id=? AND user_id=?", (tid, user_id))
             await query.edit_message_text("🗑️ Task removed.")
-            # If list became empty, nudge
-            await _maybe_send_empty_list_nudge(context.application, user_id, chat_id)
 
         elif data.startswith("DONE_"):
             tid = int(data.split("_", 1)[1])
-            gained, unlocked, badge_name = await _handle_completion(
-                tid, user_id, chat_id, context.application
-            )
+            gained, unlocked, badge_name = await _handle_completion(tid, user_id)
             if gained == 0:
                 await query.edit_message_text("⏱️ Already counted.")
                 return
@@ -546,99 +515,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⚠️ {e}")
 
 
-# ---- /reminder on|off ----
-async def reminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    up = get_or_create_user(user)
-
-    args = (context.args or [])
-    if not args:
-        status = "ON" if up.reminder_enabled else "OFF"
-        await update.message.reply_text(f"Reminders are currently {status}. Use /reminder on or /reminder off.")
-        return
-
-    toggle = args[0].lower()
-    if toggle not in {"on", "off"}:
-        await update.message.reply_text("Use: /reminder on  or  /reminder off")
-        return
-
-    new_val = 1 if toggle == "on" else 0
-    async with DB_LOCK:
-        with get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE;")
-            conn.execute(
-                "UPDATE users SET reminder_enabled=? WHERE user_id=?",
-                (new_val, user.id),
-            )
-            conn.commit()
-    await update.message.reply_text(f"Reminders turned {toggle.upper()}.")
-
-
-# ---- Jobs ----
-async def job_daily_streak(context: ContextTypes.DEFAULT_TYPE):
-    today = today_local().isoformat()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT user_id, chat_id FROM users WHERE reminder_enabled=1"
-        )
-        users = cur.fetchall()
-
-    for user_id, chat_id in users:
-        try:
-            if not had_completion_today(user_id):
-                await context.application.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "🌟 Don’t lose your streak! Complete just one small task today. "
-                        "Send /list to pick one."
-                    ),
-                )
-        except Exception as e:
-            logger.error("daily_streak send fail for %s: %s", user_id, e)
-
-
-async def job_daily_empty_list(context: ContextTypes.DEFAULT_TYPE):
-    today = today_local().isoformat()
-    with get_conn() as conn:
-        cur = conn.execute("SELECT user_id, chat_id, empty_list_notified_date FROM users")
-        users = cur.fetchall()
-
-    for user_id, chat_id, last_notified in users:
-        try:
-            if active_task_count(user_id) == 0 and last_notified != today:
-                # mark notified
-                async with DB_LOCK:
-                    with get_conn() as conn:
-                        conn.execute("BEGIN IMMEDIATE;")
-                        conn.execute(
-                            "UPDATE users SET empty_list_notified_date=? WHERE user_id=?",
-                            (today, user_id),
-                        )
-                        conn.commit()
-                await context.application.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "✨ Tip: keep a few small tasks ready so streaks stay easy.\n"
-                        "Add ideas like quick chores, 10‑min study, or a movie to start. Try /addtask."
-                    ),
-                )
-        except Exception as e:
-            logger.error("daily_empty send fail for %s: %s", user_id, e)
-
-
-# ---- Error handler ----
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Exception while handling an update: %s", context.error)
 
 
-# -------------- Profile & List from Step 3c (unchanged) --------------
-# (Reusing from previous step for brevity)
-# Include the remaining handlers from Step 3c here: profile_cmd, list_cmd, remove_cmd,
-# addtask_* handlers, completion logic, etc. (Kept above.)
-
-
-# -------------- Main --------------
-def main() -> None:
+# ========================= MAIN =========================
+def main():
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("Please set TELEGRAM_TOKEN env variable")
@@ -651,7 +533,6 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("profile", profile_cmd))
-    app.add_handler(CommandHandler("reminder", reminder_cmd))
 
     # Add-task conversation
     add_conv = ConversationHandler(
@@ -672,10 +553,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_button))
 
     app.add_error_handler(error_handler)
-
-    # Jobs (daily)
-    app.job_queue.run_daily(job_daily_streak, time=time(20, 0, tzinfo=TZ))
-    app.job_queue.run_daily(job_daily_empty_list, time=time(10, 0, tzinfo=TZ))
 
     app.run_polling(close_loop=False)
 
