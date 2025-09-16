@@ -208,103 +208,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/profile — XP, Level, Streak, Badges\n"
         "/reminder — Daily reminders toggle (next steps)\n"
     )
-    await update.message.reply_text(text)
-
-
-# ---- /profile ----
-async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    init_db()
-    user = update.effective_user
-    up = get_or_create_user(user)
-
-    current_badge = badge_name_for_streak(up.streak_current) or "—"
-    best_badge = badge_name_for_streak(up.streak_best) or "—"
-
-    with get_conn() as conn:
-        cur = conn.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND active=1", (user.id,))
-        (active_count,) = cur.fetchone()
-
-    text = (
-        "👤 <b>Profile</b>\n"
-        f"XP: <b>{up.xp}</b>\n"
-        f"Level: <b>{up.level}</b>\n"
-        f"Streak: <b>{up.streak_current}</b> (best {up.streak_best})\n"
-        f"Current badge: <b>{current_badge}</b> · Best badge: <b>{best_badge}</b>\n"
-        f"Active tasks: <b>{active_count}</b>\n"
-    )
-    await update.message.reply_html(text)
-
-
-# ---- /addtask (wizard) ----
-TITLE, DIFF = range(2)
-
-async def addtask_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    get_or_create_user(update.effective_user)
-    await update.message.reply_text("What’s the task title?")
-    return TITLE
-
-
-async def addtask_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_title"] = (update.message.text or "").strip()[:120]
-    await update.message.reply_text("Difficulty? Send 1 (easy), 2 (medium), or 3 (hard). Default is 1.")
-    return DIFF
-
-
-async def addtask_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if text not in {"1", "2", "3"}:
-        difficulty = 1
-    else:
-        difficulty = int(text)
-
-    title = context.user_data.get("new_title", "Untitled")
-    user_id = update.effective_user.id
-
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO tasks (user_id, title, difficulty, active, created_at) VALUES (?, ?, ?, 1, ?)",
-            (user_id, title, difficulty, datetime.now(TZ).isoformat()),
-        )
-
-    await update.message.reply_html(f"Added: <b>{title}</b> (difficulty {difficulty}).")
-    context.user_data.pop("new_title", None)
-    return ConversationHandler.END
-
-
-async def addtask_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("new_title", None)
-    await update.message.reply_text("Cancelled.")
-    return ConversationHandler.END
-
-
-# ---- /list & /remove ----
-
-def build_task_kb(task_id: int):
-    # Short labels to avoid Telegram's 64-char button text limit
-    buttons = [
-        [
-            InlineKeyboardButton("✅ Done", callback_data=f"DONE_{task_id}"),
-            InlineKeyboardButton("🗑 Remove", callback_data=f"DEL_{task_id}"),
-        ]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT id, title FROM tasks WHERE user_id=? AND active=1 ORDER BY id DESC LIMIT 25",
-            (user_id,),
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        await update.message.reply_text(
-            "No active tasks. Use /addtask to create one.
+    await update.message.reply_text(
+            (
+                "No active tasks. Use /addtask to create one.
 
 "
-            "Ideas: quick chores, 10‑min study, a movie to start, 3 pages to read."
+                "Ideas: quick chores, 10-min study, a movie to start, 3 pages to read."
+            )
         )
         return
 
