@@ -19,6 +19,9 @@ Deploy
 """
 from __future__ import annotations
 
+# top of file
+import asyncio
+DB_LOCK = asyncio.Lock()
 import logging
 import os
 import sqlite3
@@ -384,53 +387,105 @@ def _award_xp_and_streak(user_id: int, base_points: int) -> tuple[int, int, int,
 
 
 async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str]:
-    """
-    Inserts completion if not a double-tap (2s). Returns (gained_xp, badge_unlocked, badge_name_if_any)
-    """
-    now_iso = datetime.now(TZ).isoformat()
-    with get_conn() as conn:
-        # Validate task and get difficulty
-        cur = conn.execute(
-            "SELECT difficulty FROM tasks WHERE id=? AND user_id=? AND active=1",
-            (task_id, user_id),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise ValueError("Task not found or inactive")
-        difficulty = int(row[0])
+    now = datetime.now(TZ)
+    now_iso = now.isoformat()
+    async with DB_LOCK:
+        with get_conn() as conn:
+            # start a write transaction immediately
+            conn.execute("BEGIN IMMEDIATE;")
 
-        # Double-tap guard: last completion for this task within 2 seconds
-        cur = conn.execute(
-            "SELECT completed_at FROM completions WHERE task_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
-            (task_id, user_id),
-        )
-        last = cur.fetchone()
-        if last:
-            try:
-                last_dt = datetime.fromisoformat(last[0])
-                if (datetime.now(TZ) - last_dt).total_seconds() <= 2:
-                    return 0, False, ""  # ignore
-            except Exception:
-                pass
+            # 1) validate task & get difficulty (active=1)
+            cur = conn.execute(
+                "SELECT difficulty FROM tasks WHERE id=? AND user_id=? AND active=1",
+                (task_id, user_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                raise ValueError("Task not found or inactive")
+            difficulty = int(row[0])
 
-        # Record completion
-        conn.execute(
-            "INSERT INTO completions (task_id, user_id, completed_at) VALUES (?, ?, ?)",
-            (task_id, user_id, now_iso),
-        )
-        
-        # 🚩 Archive the task in the SAME transaction
-    conn.execute(
-        "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
-        (task_id, user_id),
-    )
+            # 2) double-tap guard (2s)
+            cur = conn.execute(
+                "SELECT completed_at FROM completions WHERE task_id=? AND user_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id, user_id),
+            )
+            last = cur.fetchone()
+            if last:
+                try:
+                    last_dt = datetime.fromisoformat(last[0])
+                    if (now - last_dt).total_seconds() <= 2:
+                        conn.rollback()
+                        return 0, False, ""  # ignore
+                except Exception:
+                    pass
 
-    base_points = 10 * max(1, min(difficulty, 3))
-    gained, lvl, new_streak, unlocked = _award_xp_and_streak(user_id, base_points)
+            # 3) insert completion
+            conn.execute(
+                "INSERT INTO completions (task_id, user_id, completed_at) VALUES (?, ?, ?)",
+                (task_id, user_id, now_iso),
+            )
 
-    badge_name = badge_name_for_streak(new_streak) if unlocked else ""
+            # 4) archive the task so it disappears from /list
+            conn.execute(
+                "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
+                (task_id, user_id),
+            )
+
+            # 5) fetch user for streak/xp
+            cur = conn.execute(
+                "SELECT xp, level, streak_current, streak_best, last_activity_date, best_badge_tier "
+                "FROM users WHERE user_id=?",
+                (user_id,),
+            )
+            xp, level, streak_current, streak_best, last_date_str, best_badge_tier = cur.fetchone()
+
+            # 6) streak math (Europe/Belgrade day)
+            today = now.date()
+            if last_date_str:
+                last_date = date.fromisoformat(last_date_str)
+                if last_date == today:
+                    pass
+                elif last_date == today - timedelta(days=1):
+                    streak_current += 1
+                else:
+                    streak_current = 1
+            else:
+                streak_current = 1
+
+            if streak_current > streak_best:
+                streak_best = streak_current
+
+            # 7) xp/level
+            base_points = 10 * max(1, min(difficulty, 3))
+            streak_bonus = min(streak_current, 10) * 2
+            gained = base_points + streak_bonus
+            xp += gained
+            level = 1 + xp // 100
+
+            # 8) badge unlock
+            def _tier(s: int) -> int:
+                for threshold, _ in BADGE_TIERS:
+                    if s >= threshold:
+                        return threshold
+                return 0
+            new_tier = _tier(streak_current)
+            unlocked = new_tier > best_badge_tier
+            if unlocked:
+                best_badge_tier = new_tier
+
+            # 9) persist user update
+            conn.execute(
+                "UPDATE users SET xp=?, level=?, streak_current=?, streak_best=?, "
+                "last_activity_date=?, best_badge_tier=? WHERE user_id=?",
+                (xp, level, streak_current, streak_best, today.isoformat(), best_badge_tier, user_id),
+            )
+
+            conn.commit()
+
+    badge_name = badge_name_for_streak(streak_current) if unlocked else ""
     return gained, unlocked, badge_name or ""
-
 
 # ---- Callbacks for inline buttons ----
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
