@@ -35,6 +35,7 @@ TZ = ZoneInfo("Europe/Belgrade")
 BOT_NAME = "GamifiedTaskBot"
 DB_PATH = os.getenv("DB_PATH", "/data/gamify.db")
 
+logger.info("DB_PATH=%s", DB_PATH)
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     level=logging.INFO,
