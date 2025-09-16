@@ -1,71 +1,72 @@
 """
-GamifiedTaskBot — Step 3c: Completions + XP + Streaks + Badges
+GamifiedTaskBot — Step 3c (Cleaned)
 
-What’s new in 3c
-- `completions` table
-- Inline ✅ DONE now records a completion
-- XP formula: 10 × difficulty + 2 × streak (streak bonus capped at +20)
-- Streak rule: first completion of a day sets/keeps the streak; missing a day resets
-- Level: 1 + xp // 100
-- Badge unlocks by streak thresholds (Jerboa→Elephant)
-- Double-tap guard: ignore duplicate DONE for the same task within 2 seconds
+MVP: tasks, completions, XP, streaks, badges. SQLite with WAL. All writes are serialized
+via a single asyncio.Lock and done in a single transaction per operation.
 
-Next steps (3d/3e): reminders and ready-list bonus
+Commands
+- /start   → greet + ensure user exists
+- /help    → commands
+- /addtask → 2-step wizard (title, difficulty; default=1)
+- /list    → show active tasks with ✅ Done / 🗑️ Delete
+- /remove  → delete-only menu
+- /profile → live stats (XP/Level/Streak/Badges + active count)
 
-Deploy
-- Env: TELEGRAM_TOKEN=<token>
-- Optional: DB_PATH=/data/gamify.db (default)
-- Start command: python main.py
+Notes
+- Streak bonus: +2×streak (capped at +20) on top of base 10×difficulty
+- Level = 1 + xp // 100
+- Badges by streak: Jerboa→Elephant
+- Europe/Belgrade timezone
+- DB path can be overridden with DB_PATH env (default /data/gamify.db)
 """
 from __future__ import annotations
 
-# top of file
 import asyncio
-DB_LOCK = asyncio.Lock()
 import logging
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
 
-# --- Config ---
+# ---------------- Config ----------------
 TZ = ZoneInfo("Europe/Belgrade")
 BOT_NAME = "GamifiedTaskBot"
 DB_PATH = os.getenv("DB_PATH", "/data/gamify.db")
 
-# --- Logging ---
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(BOT_NAME)
 
+# Serialize ALL writes to SQLite to avoid "database is locked"
+DB_LOCK = asyncio.Lock()
 
-# ========================= DB LAYER =========================
+# -------------- DB Layer --------------
 
 def get_conn() -> sqlite3.Connection:
     db_dir = os.path.dirname(DB_PATH) or "."
     os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")  # better concurrency
+    conn.execute("PRAGMA journal_mode = WAL;")
     return conn
 
 
-def init_db():
+def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(
             """
@@ -123,7 +124,8 @@ class UserProfile:
 def get_or_create_user(teleg_user) -> UserProfile:
     with get_conn() as conn:
         cur = conn.execute(
-            "SELECT user_id, chat_id, username, xp, level, streak_current, streak_best, best_badge_tier, last_activity_date, reminder_enabled, ready_list_bonus_date "
+            "SELECT user_id, chat_id, username, xp, level, streak_current, streak_best, "
+            "best_badge_tier, last_activity_date, reminder_enabled, ready_list_bonus_date "
             "FROM users WHERE user_id=?",
             (teleg_user.id,),
         )
@@ -155,8 +157,7 @@ def get_or_create_user(teleg_user) -> UserProfile:
         )
 
 
-# ========================= BADGE UTILS =========================
-
+# -------------- Badges --------------
 BADGE_TIERS = [
     (300, "Elephant 🐘"),
     (200, "Tiger 🐯"),
@@ -187,9 +188,14 @@ def badge_tier_for_streak(streak: int) -> int:
     return 0
 
 
-# ========================= BOT HANDLERS =========================
+# -------------- Helpers --------------
+
+def today_local() -> date:
+    return datetime.now(TZ).date()
+
+
+# -------------- Handlers --------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    init_db()
     user = update.effective_user
     get_or_create_user(user)
     now_local = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
@@ -217,7 +223,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- /profile ----
 async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    init_db()
     user = update.effective_user
     up = get_or_create_user(user)
 
@@ -225,7 +230,10 @@ async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best_badge = badge_name_for_streak(up.streak_best) or "—"
 
     with get_conn() as conn:
-        cur = conn.execute("SELECT COUNT(*) FROM tasks WHERE user_id=? AND active=1", (user.id,))
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE user_id=? AND active=1",
+            (user.id,),
+        )
         (active_count,) = cur.fetchone()
 
     text = (
@@ -250,30 +258,32 @@ async def addtask_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addtask_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_title"] = (update.message.text or "").strip()[:120]
-    await update.message.reply_text("Difficulty? Send 1 (easy), 2 (medium), or 3 (hard). Default is 1.")
+    await update.message.reply_text(
+        "Difficulty? Send 1 (easy), 2 (medium), or 3 (hard). Default is 1."
+    )
     return DIFF
 
 
 async def addtask_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if text not in {"1", "2", "3"}:
-        difficulty = 1
-    else:
-        difficulty = int(text)
+    difficulty = int(text) if text in {"1", "2", "3"} else 1
 
     title = context.user_data.get("new_title", "Untitled")
     user_id = update.effective_user.id
 
     async with DB_LOCK:
-    with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE;")
-        conn.execute(
-            "INSERT INTO tasks (user_id, title, difficulty, active, created_at) VALUES (?, ?, ?, 1, ?)",
-            (user_id, title, difficulty, datetime.now(TZ).isoformat()),
-        )
-        conn.commit()
+        with get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                "INSERT INTO tasks (user_id, title, difficulty, active, created_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (user_id, title, difficulty, datetime.now(TZ).isoformat()),
+            )
+            conn.commit()
 
-    await update.message.reply_html(f"Added: <b>{title}</b> (difficulty {difficulty}).")
+    await update.message.reply_html(
+        f"Added: <b>{title}</b> (difficulty {difficulty})."
+    )
     context.user_data.pop("new_title", None)
     return ConversationHandler.END
 
@@ -289,10 +299,12 @@ async def addtask_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_task_kb(rows: list[tuple[int, str]]):
     buttons = []
     for tid, title in rows:
-        buttons.append([
-            InlineKeyboardButton(f"✅ Done: {title}", callback_data=f"DONE_{tid}"),
-            InlineKeyboardButton("🗑️", callback_data=f"DEL_{tid}"),
-        ])
+        buttons.append(
+            [
+                InlineKeyboardButton(f"✅ Done: {title}", callback_data=f"DONE_{tid}"),
+                InlineKeyboardButton("🗑️", callback_data=f"DEL_{tid}"),
+            ]
+        )
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 
@@ -312,7 +324,9 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("Your tasks:", reply_markup=build_task_kb(rows))
+    await update.message.reply_text(
+        "Your tasks:", reply_markup=build_task_kb(rows)
+    )
 
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,76 +342,37 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nothing to remove. Use /addtask to create one.")
         return
 
-    buttons = [[InlineKeyboardButton(f"🗑️ {title}", callback_data=f"DEL_{tid}")] for tid, title in rows]
-    await update.message.reply_text("Choose a task to delete:", reply_markup=InlineKeyboardMarkup(buttons))
+    buttons = [
+        [InlineKeyboardButton(f"🗑️ {title}", callback_data=f"DEL_{tid}")]
+        for tid, title in rows
+    ]
+    await update.message.reply_text(
+        "Choose a task to delete:", reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 
-# ========================= COMPLETION LOGIC =========================
+# ---- Completion logic ----
 
-def _today() -> date:
-    return datetime.now(TZ).date()
-
-
-def _award_xp_and_streak(user_id: int, base_points: int) -> tuple[int, int, int, bool]:
-    """
-    Returns (gained_xp, new_level, new_streak, badge_unlocked_bool)
-    """
-    today = _today()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT xp, level, streak_current, streak_best, last_activity_date, best_badge_tier FROM users WHERE user_id=?",
-            (user_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise ValueError("User not found")
-        xp, level, streak_current, streak_best, last_date_str, best_badge_tier = row
-
-        # Streak
-        if last_date_str:
-            last_date = date.fromisoformat(last_date_str)
-            if last_date == today:
-                # already counted today; streak unchanged
-                pass
-            elif last_date == today - timedelta(days=1):
-                streak_current += 1
-            else:
-                streak_current = 1
-        else:
-            streak_current = 1
-
-        if streak_current > streak_best:
-            streak_best = streak_current
-
-        # XP
-        streak_bonus = min(streak_current, 10) * 2
-        gained = base_points + streak_bonus
-        xp += gained
-        new_level = 1 + xp // 100
-
-        # Badge unlock check
-        new_tier = badge_tier_for_streak(streak_current)
-        unlocked = new_tier > best_badge_tier
-        if unlocked:
-            best_badge_tier = new_tier
-
-        conn.execute(
-            "UPDATE users SET xp=?, level=?, streak_current=?, streak_best=?, last_activity_date=?, best_badge_tier=? WHERE user_id=?",
-            (xp, new_level, streak_current, streak_best, today.isoformat(), best_badge_tier, user_id),
-        )
-
-    return gained, new_level, streak_current, unlocked
+def _compute_streak_update(last_activity_date: str | None, today: date) -> int:
+    if not last_activity_date:
+        return 1
+    last_date = date.fromisoformat(last_activity_date)
+    if last_date == today:
+        return 0  # unchanged
+    if last_date == today - timedelta(days=1):
+        return +1
+    return -(10**6)  # reset signal
 
 
 async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str]:
     now = datetime.now(TZ)
     now_iso = now.isoformat()
+
     async with DB_LOCK:
         with get_conn() as conn:
-            # start a write transaction immediately
             conn.execute("BEGIN IMMEDIATE;")
 
-            # 1) validate task & get difficulty (active=1)
+            # 1) Validate task
             cur = conn.execute(
                 "SELECT difficulty FROM tasks WHERE id=? AND user_id=? AND active=1",
                 (task_id, user_id),
@@ -408,7 +383,7 @@ async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str
                 raise ValueError("Task not found or inactive")
             difficulty = int(row[0])
 
-            # 2) double-tap guard (2s)
+            # 2) Double-tap guard (2s)
             cur = conn.execute(
                 "SELECT completed_at FROM completions WHERE task_id=? AND user_id=? "
                 "ORDER BY id DESC LIMIT 1",
@@ -420,23 +395,21 @@ async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str
                     last_dt = datetime.fromisoformat(last[0])
                     if (now - last_dt).total_seconds() <= 2:
                         conn.rollback()
-                        return 0, False, ""  # ignore
+                        return 0, False, ""
                 except Exception:
                     pass
 
-            # 3) insert completion
+            # 3) Insert completion + archive task
             conn.execute(
                 "INSERT INTO completions (task_id, user_id, completed_at) VALUES (?, ?, ?)",
                 (task_id, user_id, now_iso),
             )
-
-            # 4) archive the task so it disappears from /list
             conn.execute(
                 "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
                 (task_id, user_id),
             )
 
-            # 5) fetch user for streak/xp
+            # 4) Fetch user & compute XP/Streak
             cur = conn.execute(
                 "SELECT xp, level, streak_current, streak_best, last_activity_date, best_badge_tier "
                 "FROM users WHERE user_id=?",
@@ -444,41 +417,29 @@ async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str
             )
             xp, level, streak_current, streak_best, last_date_str, best_badge_tier = cur.fetchone()
 
-            # 6) streak math (Europe/Belgrade day)
             today = now.date()
-            if last_date_str:
-                last_date = date.fromisoformat(last_date_str)
-                if last_date == today:
-                    pass
-                elif last_date == today - timedelta(days=1):
-                    streak_current += 1
-                else:
-                    streak_current = 1
+            delta = _compute_streak_update(last_date_str, today)
+            if delta == 0:
+                pass
+            elif delta > 0:
+                streak_current += 1
             else:
                 streak_current = 1
 
             if streak_current > streak_best:
                 streak_best = streak_current
 
-            # 7) xp/level
             base_points = 10 * max(1, min(difficulty, 3))
             streak_bonus = min(streak_current, 10) * 2
             gained = base_points + streak_bonus
             xp += gained
             level = 1 + xp // 100
 
-            # 8) badge unlock
-            def _tier(s: int) -> int:
-                for threshold, _ in BADGE_TIERS:
-                    if s >= threshold:
-                        return threshold
-                return 0
-            new_tier = _tier(streak_current)
+            new_tier = badge_tier_for_streak(streak_current)
             unlocked = new_tier > best_badge_tier
             if unlocked:
                 best_badge_tier = new_tier
 
-            # 9) persist user update
             conn.execute(
                 "UPDATE users SET xp=?, level=?, streak_current=?, streak_best=?, "
                 "last_activity_date=?, best_badge_tier=? WHERE user_id=?",
@@ -490,18 +451,25 @@ async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str
     badge_name = badge_name_for_streak(streak_current) if unlocked else ""
     return gained, unlocked, badge_name or ""
 
-# ---- Callbacks for inline buttons ----
+
+# ---- Callbacks ----
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data or ""
+    data = (query.data or "").strip()
     user_id = query.from_user.id
 
     try:
         if data.startswith("DEL_"):
             tid = int(data.split("_", 1)[1])
-            with get_conn() as conn:
-                conn.execute("UPDATE tasks SET active=0 WHERE id=? AND user_id=?", (tid, user_id))
+            async with DB_LOCK:
+                with get_conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE;")
+                    conn.execute(
+                        "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
+                        (tid, user_id),
+                    )
+                    conn.commit()
             await query.edit_message_text("🗑️ Task removed.")
 
         elif data.startswith("DONE_"):
@@ -524,8 +492,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.exception("Exception while handling an update: %s", context.error)
 
 
-# ========================= MAIN =========================
-def main():
+# -------------- Main --------------
+def main() -> None:
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("Please set TELEGRAM_TOKEN env variable")
@@ -534,12 +502,10 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("profile", profile_cmd))
 
-    # Add-task conversation
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("addtask", addtask_start)],
         states={
@@ -552,7 +518,6 @@ def main():
     )
     app.add_handler(add_conv)
 
-    # Lists and callbacks
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
