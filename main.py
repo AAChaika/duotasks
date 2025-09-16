@@ -56,8 +56,9 @@ logger = logging.getLogger(BOT_NAME)
 def get_conn() -> sqlite3.Connection:
     db_dir = os.path.dirname(DB_PATH) or "."
     os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")  # better concurrency
     return conn
 
 
