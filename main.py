@@ -264,11 +264,14 @@ async def addtask_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = context.user_data.get("new_title", "Untitled")
     user_id = update.effective_user.id
 
+    async with DB_LOCK:
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE;")
         conn.execute(
             "INSERT INTO tasks (user_id, title, difficulty, active, created_at) VALUES (?, ?, ?, 1, ?)",
             (user_id, title, difficulty, datetime.now(TZ).isoformat()),
         )
+        conn.commit()
 
     await update.message.reply_html(f"Added: <b>{title}</b> (difficulty {difficulty}).")
     context.user_data.pop("new_title", None)
