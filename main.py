@@ -417,6 +417,12 @@ async def _handle_completion(task_id: int, user_id: int) -> tuple[int, bool, str
             "INSERT INTO completions (task_id, user_id, completed_at) VALUES (?, ?, ?)",
             (task_id, user_id, now_iso),
         )
+        
+        # 🚩 Archive the task in the SAME transaction
+    conn.execute(
+        "UPDATE tasks SET active=0 WHERE id=? AND user_id=?",
+        (task_id, user_id),
+    )
 
     base_points = 10 * max(1, min(difficulty, 3))
     gained, lvl, new_streak, unlocked = _award_xp_and_streak(user_id, base_points)
